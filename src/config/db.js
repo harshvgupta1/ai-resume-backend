@@ -3,12 +3,14 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+const dbPassword = (process.env.DB_PASSWORD || "").trim().replace(/^["']|["']$/g, "");
+
 // Create connection pool for MySQL
 export const pool = mysql.createPool({
   host: process.env.DB_HOST || "localhost",
   port: Number(process.env.DB_PORT) || 3306,
   user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
+  password: dbPassword,
   database: process.env.DB_NAME || "ai_resume_screener",
   waitForConnections: true,
   connectionLimit: 10,

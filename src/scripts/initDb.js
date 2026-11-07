@@ -9,7 +9,7 @@ async function initDatabase() {
   const dbHost = process.env.DB_HOST || "localhost";
   const dbPort = Number(process.env.DB_PORT) || 3306;
   const dbUser = process.env.DB_USER || "root";
-  const dbPassword = process.env.DB_PASSWORD || "";
+  const dbPassword = (process.env.DB_PASSWORD || "").trim().replace(/^["']|["']$/g, "");
   const dbName = process.env.DB_NAME || "ai_resume_screener";
 
   try {
