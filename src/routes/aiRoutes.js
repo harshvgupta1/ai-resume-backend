@@ -1,9 +1,12 @@
 import { Router } from "express";
-import { matchResume } from "../controllers/aiController.js";
+import { matchResume, getAnalysisHistory } from "../controllers/aiController.js";
 import { uploadAndParseResume } from "../controllers/resumeController.js";
 import { upload } from "../middleware/upload.js";
 
 const router = Router();
+
+// GET /api/ai/history - Fetch past match analyses from MySQL
+router.get("/history", getAnalysisHistory);
 
 // POST /api/ai/match - Run AI evaluation with text input
 router.post("/match", matchResume);
