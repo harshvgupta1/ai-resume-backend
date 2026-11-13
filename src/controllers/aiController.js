@@ -42,6 +42,7 @@ ${jobDescription.slice(0, 4000)}
 
 Respond with STRICT JSON adhering to this exact schema:
 {
+  "jobTitle": string (extract the exact job title/role name from the job description, e.g. "Senior Frontend Engineer", "Full Stack Developer", "AI Engineer". If not explicitly stated, infer from context. Keep it concise, max 5 words.),
   "matchScore": number (integer between 0 and 100 representing overall ATS match),
   "verdict": string ("Strong Match" if score >= 80, "Moderate Match" if 60-79, "Low Match" if < 60),
   "matchingSkills": string[] (list of technical and soft skills present in both),
@@ -93,7 +94,21 @@ Respond with STRICT JSON adhering to this exact schema:
     }
 
     const scanId = crypto.randomUUID();
-    const finalRole = targetRole || "Full Stack Engineer";
+    // Use Gemini-extracted jobTitle if available, then passed targetRole, then smart extraction from JD
+    const extractedTitle = analysisResult.jobTitle;
+    delete analysisResult.jobTitle; // don't expose internal field
+    const finalRole = extractedTitle || targetRole || (() => {
+      // Smart extraction: look for common job title patterns in JD
+      const jd = jobDescription.slice(0, 500);
+      const titleMatch = jd.match(
+        /(?:looking for|we(?:'re| are) hiring|hiring a?n?|role[:\s]+|position[:\s]+|job title[:\s]+|title[:\s]+)\s*([A-Z][A-Za-z\s\/\(\)&]+?)(?:\s*[-–,\n]|with \d|\s+to\s)/i
+      );
+      if (titleMatch) return titleMatch[1].trim().slice(0, 50);
+      // Fallback: grab first capitalised phrase (likely a title)
+      const firstCap = jd.match(/^([A-Z][A-Za-z\s\/]+?)(?:\s*[-–,\n])/);
+      if (firstCap) return firstCap[1].trim().slice(0, 50);
+      return "Full Stack Engineer";
+    })();
     analysisResult.id = scanId;
     analysisResult.targetRole = finalRole;
     analysisResult.createdAt = "Just now";
