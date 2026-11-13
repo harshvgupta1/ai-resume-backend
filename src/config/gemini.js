@@ -12,10 +12,10 @@ if (!apiKey) {
 
 const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null;
 
-export const getGeminiModel = () => {
+export const getGeminiModel = (modelName = "gemini-3.5-flash") => {
   if (!genAI) return null;
   return genAI.getGenerativeModel({
-    model: "gemini-1.5-flash",
+    model: modelName,
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0.2, // Lower temperature for consistent deterministic scoring

@@ -27,7 +27,7 @@ export const matchResume = async (req, res) => {
     }
 
     const model = getGeminiModel();
-    let analysisResult;
+    let analysisResult = null;
 
     if (model) {
       const prompt = `
@@ -52,11 +52,26 @@ Respond with STRICT JSON adhering to this exact schema:
 }
 `;
 
-      const result = await model.generateContent(prompt);
-      const responseText = result.response.text();
-      analysisResult = JSON.parse(responseText);
-    } else {
-      // Fallback intelligent heuristic analyzer when GEMINI_API_KEY is not yet populated
+      try {
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text();
+        analysisResult = JSON.parse(responseText);
+      } catch (geminiErr) {
+        console.warn("Primary Gemini model encountered error, trying backup:", geminiErr.message);
+        try {
+          const backupModel = getGeminiModel("gemini-3.8-flash");
+          if (backupModel) {
+            const backupResult = await backupModel.generateContent(prompt);
+            analysisResult = JSON.parse(backupResult.response.text());
+          }
+        } catch (backupErr) {
+          console.warn("Backup Gemini model also failed, falling back to heuristic:", backupErr.message);
+        }
+      }
+    }
+
+    if (!analysisResult) {
+      // Fallback intelligent heuristic analyzer when API key is unavailable or during rate spikes
       const jdWords = jobDescription.toLowerCase().split(/\W+/).filter((w) => w.length > 3);
       const resumeWords = new Set(resumeText.toLowerCase().split(/\W+/));
       const common = jdWords.filter((w) => resumeWords.has(w));
