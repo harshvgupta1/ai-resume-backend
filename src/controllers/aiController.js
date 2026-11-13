@@ -113,29 +113,34 @@ Respond with STRICT JSON adhering to this exact schema:
     analysisResult.targetRole = finalRole;
     analysisResult.createdAt = "Just now";
 
-    // Persist to MySQL if available
-    try {
-      await pool.query(
-        `INSERT INTO match_analyses 
-        (id, user_id, resume_id, target_role, job_description, match_score, verdict, matching_skills, missing_skills, strengths, improvements, suggested_edits)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          scanId,
-          userId,
-          resumeId || null,
-          finalRole,
-          jobDescription.slice(0, 3000),
-          analysisResult.matchScore,
-          analysisResult.verdict,
-          JSON.stringify(analysisResult.matchingSkills),
-          JSON.stringify(analysisResult.missingSkills),
-          JSON.stringify(analysisResult.strengths),
-          JSON.stringify(analysisResult.improvements),
-          JSON.stringify(analysisResult.suggestedResumeEdits),
-        ]
-      );
-    } catch (dbErr) {
-      console.warn("[MySQL] Could not save analysis to DB (continuing without persist):", dbErr.message);
+    // Persist to MySQL only if the user is authenticated
+    if (userId) {
+      try {
+        await pool.query(
+          `INSERT INTO match_analyses 
+          (id, user_id, resume_id, target_role, job_description, match_score, verdict, matching_skills, missing_skills, strengths, improvements, suggested_edits)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            scanId,
+            userId,
+            resumeId || null,
+            finalRole,
+            jobDescription.slice(0, 3000),
+            analysisResult.matchScore,
+            analysisResult.verdict,
+            JSON.stringify(analysisResult.matchingSkills),
+            JSON.stringify(analysisResult.missingSkills),
+            JSON.stringify(analysisResult.strengths),
+            JSON.stringify(analysisResult.improvements),
+            JSON.stringify(analysisResult.suggestedResumeEdits),
+          ]
+        );
+        console.log(`[DB] Analysis saved for user ${userId}`);
+      } catch (dbErr) {
+        console.warn("[MySQL] Could not save analysis to DB (continuing without persist):", dbErr.message);
+      }
+    } else {
+      console.log("[DB] Skipping DB save — user not authenticated. Result will be stored in localStorage by frontend.");
     }
 
     return res.status(200).json(analysisResult);
@@ -160,7 +165,12 @@ export const getAnalysisHistory = async (req, res) => {
       } catch (e) {}
     }
 
-    let query = `
+    // If user is not logged in, return empty — frontend uses localStorage
+    if (!userId) {
+      return res.status(200).json([]);
+    }
+
+    const query = `
       SELECT 
         m.id,
         m.user_id,
@@ -180,17 +190,12 @@ export const getAnalysisHistory = async (req, res) => {
         r.file_size
       FROM match_analyses m
       LEFT JOIN resumes r ON m.resume_id = r.id
+      WHERE m.user_id = ?
+      ORDER BY m.created_at DESC
+      LIMIT 50
     `;
-    const params = [];
 
-    if (userId) {
-      query += ` WHERE m.user_id = ? OR m.user_id IS NULL`;
-      params.push(userId);
-    }
-
-    query += ` ORDER BY m.created_at DESC LIMIT 20`;
-
-    const [rows] = await pool.query(query, params);
+    const [rows] = await pool.query(query, [userId]);
 
     const formattedScans = rows.map((row) => {
       let createdFormatted = "Recently";
@@ -223,5 +228,30 @@ export const getAnalysisHistory = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving analysis history:", error);
     return res.status(500).json({ error: "Failed to retrieve scans", details: error.message });
+  }
+};
+
+export const deleteAnalysis = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const authHeader = req.headers.authorization;
+    let userId = null;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (e) {}
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    await pool.query("DELETE FROM match_analyses WHERE id = ? AND user_id = ?", [id, userId]);
+    return res.status(200).json({ success: true, message: "Analysis deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting analysis:", error);
+    return res.status(500).json({ error: "Failed to delete analysis", details: error.message });
   }
 };

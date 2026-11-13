@@ -1,10 +1,13 @@
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const pdfParse = require("pdf-parse");
 
 import { pool } from "../config/db.js";
 import { getGeminiModel } from "../config/gemini.js";
+
+const JWT_SECRET = process.env.JWT_SECRET || "ai_resume_super_secret_jwt_key_2026";
 
 export const uploadAndParseResume = async (req, res) => {
   try {
@@ -26,23 +29,55 @@ export const uploadAndParseResume = async (req, res) => {
       return res.status(400).json({ error: "Could not extract text from the provided document." });
     }
 
-    const resumeId = crypto.randomUUID();
+    // Extract user from token if available
+    const authHeader = req.headers.authorization;
+    let userId = null;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (e) {}
+    }
 
-    // Save to MySQL
-    try {
-      await pool.query(
-        `INSERT INTO resumes (id, candidate_name, file_name, file_size, raw_text)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          resumeId,
-          req.body.candidateName || null,
-          req.file.originalname,
-          req.file.size,
-          extractedText,
-        ]
-      );
-    } catch (dbErr) {
-      console.warn("[MySQL] Warning: Could not save resume record to database:", dbErr.message);
+    let resumeId = null;
+
+    // Only save resume to MySQL if user is logged in
+    if (userId) {
+      resumeId = crypto.randomUUID();
+      try {
+        await pool.query(
+          `INSERT INTO resumes (id, user_id, candidate_name, file_name, file_size, raw_text)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            resumeId,
+            userId,
+            req.body.candidateName || null,
+            req.file.originalname,
+            req.file.size,
+            extractedText,
+          ]
+        );
+      } catch (dbErr) {
+        // If user_id column doesn't exist on resumes, fallback without user_id
+        try {
+          await pool.query(
+            `INSERT INTO resumes (id, candidate_name, file_name, file_size, raw_text)
+             VALUES (?, ?, ?, ?, ?)`,
+            [
+              resumeId,
+              req.body.candidateName || null,
+              req.file.originalname,
+              req.file.size,
+              extractedText,
+            ]
+          );
+        } catch (fallbackErr) {
+          console.warn("[MySQL] Warning: Could not save resume record to database:", fallbackErr.message);
+        }
+      }
+    } else {
+      console.log("[DB] Resume upload: Skipping DB save for unauthenticated user.");
     }
 
     // If jobDescription was sent in the same multipart request, immediately run match analysis!
