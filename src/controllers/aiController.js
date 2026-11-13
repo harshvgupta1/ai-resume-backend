@@ -15,15 +15,48 @@ export const matchResume = async (req, res) => {
       });
     }
 
-    // Extract user from token if available
-    const authHeader = req.headers.authorization;
-    let userId = null;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      try {
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        userId = decoded.id;
-      } catch (e) {}
+    // Extract user from token or middleware
+    let userId = req.userId || null;
+    if (!userId) {
+      const authHeader = req.headers.authorization;
+      if (authHeader && authHeader.startsWith("Bearer ")) {
+        try {
+          const token = authHeader.split(" ")[1];
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userId = decoded.id;
+        } catch (e) {}
+      }
+    }
+
+    if (!userId) {
+      return res.status(401).json({
+        error: "Please sign in to run AI resume analysis and claim your 3 free scans.",
+        requiresAuth: true,
+      });
+    }
+
+    // Verify quota & plan
+    const [userRows] = await pool.query(
+      `SELECT plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: "User account not found." });
+    }
+
+    const userProfile = userRows[0];
+    const isPro = userProfile.plan === "pro";
+    const scansUsed = userProfile.scans_used || 0;
+    const FREE_LIMIT = 3;
+
+    if (!isPro && scansUsed >= FREE_LIMIT) {
+      return res.status(403).json({
+        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for unlimited AI scans!`,
+        upgradeRequired: true,
+        scansUsed,
+        scansLimit: FREE_LIMIT,
+      });
     }
 
     const model = getGeminiModel();
@@ -114,6 +147,7 @@ Respond with STRICT JSON adhering to this exact schema:
     analysisResult.createdAt = "Just now";
 
     // Persist to MySQL only if the user is authenticated
+    let newScansUsed = scansUsed;
     if (userId) {
       try {
         await pool.query(
@@ -135,13 +169,21 @@ Respond with STRICT JSON adhering to this exact schema:
             JSON.stringify(analysisResult.suggestedResumeEdits),
           ]
         );
-        console.log(`[DB] Analysis saved for user ${userId}`);
+
+        // Increment scan count for free users
+        if (!isPro) {
+          await pool.query(`UPDATE users SET scans_used = scans_used + 1 WHERE id = ?`, [userId]);
+          newScansUsed += 1;
+        }
+        console.log(`[DB] Analysis saved for user ${userId} (scans_used: ${newScansUsed})`);
       } catch (dbErr) {
         console.warn("[MySQL] Could not save analysis to DB (continuing without persist):", dbErr.message);
       }
-    } else {
-      console.log("[DB] Skipping DB save — user not authenticated. Result will be stored in localStorage by frontend.");
     }
+
+    analysisResult.userPlan = isPro ? "pro" : "free";
+    analysisResult.scansUsed = newScansUsed;
+    analysisResult.scansLimit = FREE_LIMIT;
 
     return res.status(200).json(analysisResult);
   } catch (error) {
@@ -253,5 +295,73 @@ export const deleteAnalysis = async (req, res) => {
   } catch (error) {
     console.error("Error deleting analysis:", error);
     return res.status(500).json({ error: "Failed to delete analysis", details: error.message });
+  }
+};
+
+export const generateCoverLetter = async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    let userId = null;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch (e) {}
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "Please sign in to generate a tailored cover letter.", requiresAuth: true });
+    }
+
+    const [userRows] = await pool.query("SELECT plan FROM users WHERE id = ?", [userId]);
+    if (userRows.length === 0 || userRows[0].plan !== "pro") {
+      return res.status(403).json({
+        error: "AI Cover Letter Generator is an exclusive PRO feature. Upgrade to Pro to unlock!",
+        upgradeRequired: true,
+      });
+    }
+
+    const { jobDescription, targetRole, candidateName, skills, strengths } = req.body;
+    if (!jobDescription) {
+      return res.status(400).json({ error: "jobDescription is required." });
+    }
+
+    const model = getGeminiModel();
+    if (!model) {
+      return res.status(500).json({ error: "Gemini AI model currently unavailable" });
+    }
+
+    const prompt = `
+You are an executive career coach and elite copywriter.
+Write a highly compelling, professional, tailored cover letter for candidate "${candidateName || "Candidate"}" applying for the role of "${targetRole || "Software Engineer"}".
+
+MATCHED SKILLS:
+${(skills || []).join(", ")}
+
+KEY STRENGTHS:
+${(strengths || []).join("; ")}
+
+JOB REQUIREMENTS:
+${jobDescription.slice(0, 3000)}
+
+Guidelines:
+1. Highly engaging, confident, and professional (300-350 words).
+2. Directly align candidate achievements and core skills to the company's pain points.
+3. Include standard professional greeting and closing.
+4. Output clean markdown without meta-chatter.
+`;
+
+    const result = await model.generateContent(prompt);
+    const coverLetter = result.response.text();
+
+    return res.status(200).json({
+      success: true,
+      coverLetter,
+      targetRole: targetRole || "Software Engineer",
+    });
+  } catch (err) {
+    console.error("Cover letter error:", err);
+    return res.status(500).json({ error: "Failed to generate cover letter", details: err.message });
   }
 };

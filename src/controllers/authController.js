@@ -79,7 +79,10 @@ export const googleLogin = async (req, res) => {
     };
 
     try {
-      const [rows] = await pool.query(`SELECT id, email, name, avatar_url FROM users WHERE email = ?`, [googleUser.email]);
+      const [rows] = await pool.query(
+        `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE email = ?`,
+        [googleUser.email]
+      );
       if (rows.length > 0) {
         activeUser = rows[0];
       }
@@ -107,6 +110,10 @@ export const googleLogin = async (req, res) => {
         email: activeUser.email,
         name: activeUser.name,
         avatarUrl: activeUser.avatarUrl || activeUser.avatar_url,
+        plan: activeUser.plan || "free",
+        scansUsed: activeUser.scans_used ?? 0,
+        scansLimit: 3,
+        proExpiresAt: activeUser.pro_expires_at || null,
       },
     });
   } catch (error) {
@@ -122,7 +129,7 @@ export const getMe = async (req, res) => {
   try {
     const userId = req.user.id;
     const [rows] = await pool.query(
-      `SELECT id, email, name, avatar_url, created_at, last_login_at FROM users WHERE id = ?`,
+      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, created_at, last_login_at FROM users WHERE id = ?`,
       [userId]
     );
 
@@ -130,8 +137,59 @@ export const getMe = async (req, res) => {
       return res.status(404).json({ error: "User profile not found." });
     }
 
-    return res.status(200).json({ user: rows[0] });
+    const u = rows[0];
+    return res.status(200).json({
+      user: {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        avatarUrl: u.avatar_url,
+        plan: u.plan || "free",
+        scansUsed: u.scans_used ?? 0,
+        scansLimit: 3,
+        proExpiresAt: u.pro_expires_at || null,
+        createdAt: u.created_at,
+      },
+    });
   } catch (error) {
     return res.status(500).json({ error: "Failed to fetch user profile", details: error.message });
+  }
+};
+
+export const upgradePlan = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { plan = "pro" } = req.body;
+
+    await pool.query(
+      `UPDATE users 
+       SET plan = ?, pro_expires_at = DATE_ADD(NOW(), INTERVAL 30 DAY) 
+       WHERE id = ?`,
+      [plan, userId]
+    );
+
+    const [rows] = await pool.query(
+      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
+      [userId]
+    );
+
+    const u = rows[0];
+    return res.status(200).json({
+      success: true,
+      message: `Successfully upgraded to ${plan.toUpperCase()}!`,
+      user: {
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        avatarUrl: u.avatar_url,
+        plan: u.plan,
+        scansUsed: u.scans_used ?? 0,
+        scansLimit: 3,
+        proExpiresAt: u.pro_expires_at,
+      },
+    });
+  } catch (error) {
+    console.error("Error upgrading plan:", error);
+    return res.status(500).json({ error: "Failed to upgrade plan", details: error.message });
   }
 };

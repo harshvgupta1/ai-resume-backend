@@ -29,7 +29,7 @@ export const uploadAndParseResume = async (req, res) => {
       return res.status(400).json({ error: "Could not extract text from the provided document." });
     }
 
-    // Extract user from token if available
+    // Extract user from token
     const authHeader = req.headers.authorization;
     let userId = null;
     if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -40,50 +40,79 @@ export const uploadAndParseResume = async (req, res) => {
       } catch (e) {}
     }
 
-    let resumeId = null;
+    // Require sign in so we can accurately track the 3 free scans
+    if (!userId) {
+      return res.status(401).json({
+        error: "Please sign in to scan your resume and claim your 3 free AI analyses.",
+        requiresAuth: true,
+      });
+    }
 
-    // Only save resume to MySQL if user is logged in
-    if (userId) {
-      resumeId = crypto.randomUUID();
+    // Check user plan and quota
+    const [userRows] = await pool.query(
+      "SELECT plan, scans_used, pro_expires_at FROM users WHERE id = ?",
+      [userId]
+    );
+
+    if (userRows.length === 0) {
+      return res.status(404).json({ error: "User account not found." });
+    }
+
+    const userRecord = userRows[0];
+    const isPro = userRecord.plan === "pro";
+    const scansUsed = userRecord.scans_used || 0;
+    const FREE_LIMIT = 3;
+
+    if (!isPro && scansUsed >= FREE_LIMIT) {
+      return res.status(403).json({
+        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for unlimited AI scans!`,
+        upgradeRequired: true,
+        scansUsed,
+        scansLimit: FREE_LIMIT,
+      });
+    }
+
+    const resumeId = crypto.randomUUID();
+
+    // Save resume to MySQL
+    try {
+      await pool.query(
+        `INSERT INTO resumes (id, user_id, candidate_name, file_name, file_size, raw_text)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          resumeId,
+          userId,
+          req.body.candidateName || null,
+          req.file.originalname,
+          req.file.size,
+          extractedText,
+        ]
+      );
+    } catch (dbErr) {
       try {
         await pool.query(
-          `INSERT INTO resumes (id, user_id, candidate_name, file_name, file_size, raw_text)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO resumes (id, candidate_name, file_name, file_size, raw_text)
+           VALUES (?, ?, ?, ?, ?)`,
           [
             resumeId,
-            userId,
             req.body.candidateName || null,
             req.file.originalname,
             req.file.size,
             extractedText,
           ]
         );
-      } catch (dbErr) {
-        // If user_id column doesn't exist on resumes, fallback without user_id
-        try {
-          await pool.query(
-            `INSERT INTO resumes (id, candidate_name, file_name, file_size, raw_text)
-             VALUES (?, ?, ?, ?, ?)`,
-            [
-              resumeId,
-              req.body.candidateName || null,
-              req.file.originalname,
-              req.file.size,
-              extractedText,
-            ]
-          );
-        } catch (fallbackErr) {
-          console.warn("[MySQL] Warning: Could not save resume record to database:", fallbackErr.message);
-        }
+      } catch (fallbackErr) {
+        console.warn("[MySQL] Warning: Could not save resume record to database:", fallbackErr.message);
       }
-    } else {
-      console.log("[DB] Resume upload: Skipping DB save for unauthenticated user.");
     }
 
     // If jobDescription was sent in the same multipart request, immediately run match analysis!
     if (req.body.jobDescription) {
       req.body.resumeText = extractedText;
       req.body.resumeId = resumeId;
+      req.userId = userId;
+      req.userPlan = userRecord.plan || "free";
+      req.scansUsed = scansUsed;
       const { matchResume } = await import("./aiController.js");
       return matchResume(req, res);
     }
