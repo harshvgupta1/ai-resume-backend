@@ -138,6 +138,47 @@ export const getMe = async (req, res) => {
     }
 
     const u = rows[0];
+
+    // Check latest subscription from `subscriptions` table
+    let activeSubscription = null;
+    try {
+      const [subRows] = await pool.query(
+        `SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+        [userId]
+      );
+      if (subRows.length > 0) {
+        const sub = subRows[0];
+        const now = new Date();
+        const expiryDate = new Date(sub.current_period_end);
+        const isExpired = expiryDate < now;
+
+        if (isExpired && sub.status === "active") {
+          await pool.query(`UPDATE subscriptions SET status = 'expired' WHERE id = ?`, [sub.id]);
+          await pool.query(`UPDATE users SET plan = 'free' WHERE id = ?`, [userId]);
+          sub.status = "expired";
+          u.plan = "free";
+        }
+
+        const daysRemaining = Math.max(0, Math.ceil((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+
+        activeSubscription = {
+          id: sub.id,
+          plan: sub.plan,
+          billingCycle: sub.billing_cycle,
+          status: sub.status,
+          amount: sub.amount,
+          currency: sub.currency,
+          currentPeriodStart: sub.current_period_start,
+          currentPeriodEnd: sub.current_period_end,
+          daysRemaining,
+          isExpired,
+          cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
+        };
+      }
+    } catch (subErr) {
+      console.warn("Could not fetch subscription in getMe:", subErr.message);
+    }
+
     return res.status(200).json({
       user: {
         id: u.id,
@@ -147,8 +188,9 @@ export const getMe = async (req, res) => {
         plan: u.plan || "free",
         scansUsed: u.scans_used ?? 0,
         scansLimit: 3,
-        proExpiresAt: u.pro_expires_at || null,
+        proExpiresAt: u.pro_expires_at || (activeSubscription ? activeSubscription.currentPeriodEnd : null),
         createdAt: u.created_at,
+        subscription: activeSubscription,
       },
     });
   } catch (error) {
@@ -167,6 +209,20 @@ export const upgradePlan = async (req, res) => {
        WHERE id = ?`,
       [plan, userId]
     );
+
+    // Also record in subscriptions table
+    const subscriptionId = crypto.randomUUID();
+    try {
+      await pool.query(
+        `INSERT INTO subscriptions (
+           id, user_id, plan, billing_cycle, status, amount, currency,
+           current_period_start, current_period_end
+         ) VALUES (?, ?, 'pro_monthly', 'monthly', 'active', 49900, 'INR', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY))`,
+        [subscriptionId, userId]
+      );
+    } catch (subErr) {
+      console.warn("Subscription record warning in upgradePlan:", subErr.message);
+    }
 
     const [rows] = await pool.query(
       `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,

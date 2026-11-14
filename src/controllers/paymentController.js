@@ -71,7 +71,7 @@ export const createOrder = async (req, res) => {
 
 /**
  * POST /api/payment/verify
- * Cryptographically verifies Razorpay HMAC signature & upgrades user plan
+ * Cryptographically verifies Razorpay HMAC signature, creates/updates subscription & upgrades user plan
  */
 export const verifyPayment = async (req, res) => {
   try {
@@ -116,7 +116,38 @@ export const verifyPayment = async (req, res) => {
       console.warn("[MySQL] Warning updating payment record status:", dbErr.message);
     }
 
-    // 2. Upgrade user account to PRO with expiry in MySQL
+    // 2. Mark any older active subscriptions for this user as superseded
+    try {
+      await pool.query(
+        `UPDATE subscriptions 
+         SET status = 'cancelled', updated_at = NOW() 
+         WHERE user_id = ? AND status = 'active'`,
+        [userId]
+      );
+    } catch (subErr) {
+      console.warn("[MySQL] Subscriptions status update warning:", subErr.message);
+    }
+
+    // 3. Insert new active subscription record into MySQL `subscriptions` table
+    const subscriptionId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO subscriptions (
+         id, user_id, plan, billing_cycle, status, amount, currency,
+         razorpay_order_id, razorpay_payment_id, current_period_start, current_period_end
+       ) VALUES (?, ?, ?, ?, 'active', ?, 'INR', ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))`,
+      [
+        subscriptionId,
+        userId,
+        `pro_${plan}`,
+        plan === "yearly" ? "yearly" : "monthly",
+        planConfig.amount,
+        razorpay_order_id,
+        razorpay_payment_id,
+        daysToAdd,
+      ]
+    );
+
+    // 4. Upgrade user account to PRO with expiry in MySQL `users` table
     await pool.query(
       `UPDATE users 
        SET plan = 'pro', pro_expires_at = DATE_ADD(NOW(), INTERVAL ? DAY)
@@ -124,15 +155,25 @@ export const verifyPayment = async (req, res) => {
       [daysToAdd, userId]
     );
 
-    // 3. Fetch fresh user profile
-    const [rows] = await pool.query(
+    // 5. Fetch fresh user profile & newly created subscription
+    const [userRows] = await pool.query(
       `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
       [userId]
     );
+    const updatedUser = userRows[0] || {};
 
-    const updatedUser = rows[0] || {};
+    const [subRows] = await pool.query(
+      `SELECT * FROM subscriptions WHERE id = ?`,
+      [subscriptionId]
+    );
+    const activeSub = subRows[0] || null;
 
-    console.log(`[Razorpay] Successfully upgraded user ${userId} to PRO via ${razorpay_payment_id}`);
+    const expiresAt = activeSub?.current_period_end || updatedUser.pro_expires_at;
+    const daysRemaining = expiresAt
+      ? Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
+      : daysToAdd;
+
+    console.log(`[Razorpay] Upgraded user ${userId} to PRO. Subscription: ${subscriptionId}, Expires: ${expiresAt}`);
 
     return res.status(200).json({
       success: true,
@@ -148,6 +189,20 @@ export const verifyPayment = async (req, res) => {
         scansLimit: 3,
         proExpiresAt: updatedUser.pro_expires_at,
       },
+      subscription: activeSub
+        ? {
+            id: activeSub.id,
+            plan: activeSub.plan,
+            billingCycle: activeSub.billing_cycle,
+            status: activeSub.status,
+            amount: activeSub.amount,
+            currency: activeSub.currency,
+            currentPeriodStart: activeSub.current_period_start,
+            currentPeriodEnd: activeSub.current_period_end,
+            daysRemaining,
+            isExpired: false,
+          }
+        : null,
     });
   } catch (error) {
     console.error("Payment verification server error:", error);
@@ -155,5 +210,104 @@ export const verifyPayment = async (req, res) => {
       error: "Payment verification failed on server.",
       details: error.message,
     });
+  }
+};
+
+/**
+ * GET /api/payment/subscription
+ * Retrieves the current user's active subscription and exact expiration details from `subscriptions` table
+ */
+export const getSubscription = async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Fetch latest subscription record from subscriptions table
+    const [subRows] = await pool.query(
+      `SELECT * FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1`,
+      [userId]
+    );
+
+    if (subRows.length === 0) {
+      return res.status(200).json({
+        success: true,
+        plan: "free",
+        hasActiveSubscription: false,
+        subscription: null,
+      });
+    }
+
+    const sub = subRows[0];
+    const now = new Date();
+    const expiryDate = new Date(sub.current_period_end);
+    const isExpired = expiryDate < now;
+    const daysRemaining = Math.max(0, Math.ceil((expiryDate.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)));
+
+    // Auto-sync status if expired
+    if (isExpired && sub.status === "active") {
+      try {
+        await pool.query(`UPDATE subscriptions SET status = 'expired' WHERE id = ?`, [sub.id]);
+        await pool.query(`UPDATE users SET plan = 'free' WHERE id = ?`, [userId]);
+        sub.status = "expired";
+      } catch (e) {
+        console.warn("Could not update expired status in DB:", e.message);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      hasActiveSubscription: !isExpired && sub.status === "active",
+      plan: !isExpired && sub.status === "active" ? "pro" : "free",
+      subscription: {
+        id: sub.id,
+        plan: sub.plan,
+        billingCycle: sub.billing_cycle,
+        status: sub.status,
+        amount: sub.amount,
+        amountFormatted: `₹${(sub.amount / 100).toLocaleString("en-IN")}`,
+        currency: sub.currency,
+        razorpayPaymentId: sub.razorpay_payment_id,
+        razorpayOrderId: sub.razorpay_order_id,
+        currentPeriodStart: sub.current_period_start,
+        currentPeriodEnd: sub.current_period_end,
+        expiresAtFormatted: expiryDate.toLocaleDateString("en-US", {
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+        }),
+        daysRemaining,
+        isExpired,
+        cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
+      },
+    });
+  } catch (error) {
+    console.error("Error retrieving user subscription:", error);
+    return res.status(500).json({
+      error: "Failed to retrieve subscription status.",
+      details: error.message,
+    });
+  }
+};
+
+/**
+ * POST /api/payment/cancel
+ * Cancel auto-renewal at period end
+ */
+export const cancelSubscription = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    await pool.query(
+      `UPDATE subscriptions 
+       SET cancel_at_period_end = 1, cancelled_at = NOW() 
+       WHERE user_id = ? AND status = 'active'`,
+      [userId]
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Subscription auto-renewal has been cancelled. Your PRO access will remain active until the end of your current billing period.",
+    });
+  } catch (error) {
+    console.error("Cancel subscription error:", error);
+    return res.status(500).json({ error: "Failed to cancel subscription", details: error.message });
   }
 };

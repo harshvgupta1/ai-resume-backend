@@ -101,6 +101,51 @@ async function initDatabase() {
     `);
     console.log("✅ Table `job_applications` created or verified.");
 
+    // 5. Payments table
+    await dbConn.query(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        order_id VARCHAR(255) NOT NULL,
+        payment_id VARCHAR(255) NULL,
+        signature VARCHAR(255) NULL,
+        amount INT NOT NULL,
+        currency VARCHAR(10) DEFAULT 'INR',
+        plan VARCHAR(20) DEFAULT 'monthly',
+        status VARCHAR(50) DEFAULT 'created',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user (user_id),
+        INDEX idx_order (order_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+    console.log("✅ Table `payments` created or verified.");
+
+    // 6. Subscriptions table (track recurring Pro plans and expiration dates)
+    await dbConn.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        plan VARCHAR(50) NOT NULL DEFAULT 'pro_monthly',
+        billing_cycle ENUM('monthly', 'yearly') NOT NULL DEFAULT 'monthly',
+        status ENUM('active', 'expired', 'cancelled', 'past_due') NOT NULL DEFAULT 'active',
+        amount INT NOT NULL DEFAULT 49900,
+        currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+        razorpay_order_id VARCHAR(255) NULL,
+        razorpay_payment_id VARCHAR(255) NULL,
+        razorpay_subscription_id VARCHAR(255) NULL,
+        current_period_start TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        current_period_end TIMESTAMP NOT NULL,
+        cancel_at_period_end BOOLEAN NOT NULL DEFAULT FALSE,
+        cancelled_at TIMESTAMP NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_user_id (user_id),
+        INDEX idx_status (status),
+        INDEX idx_period_end (current_period_end)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    console.log("✅ Table `subscriptions` created or verified.");
+
     await dbConn.end();
     console.log("🎉 All MySQL schema migrations executed successfully!");
   } catch (err) {
