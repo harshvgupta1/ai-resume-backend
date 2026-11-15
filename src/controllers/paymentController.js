@@ -1,9 +1,7 @@
 import crypto from "crypto";
 import { razorpayInstance, RAZORPAY_CONFIG } from "../config/razorpay.js";
 import { pool } from "../config/db.js";
-
-// Standard exchange rate: 1 USD = 86.00 INR
-const EXCHANGE_RATE = 86.0;
+import { getLiveUsdToInrRate } from "../services/currencyService.js";
 
 // Standard Statutory Tax Rate for SaaS Services in India: 18% GST
 const GST_RATE = 0.18;
@@ -25,21 +23,23 @@ const PLANS = {
 };
 
 /**
- * Helper to compute subtotal, 18% GST, and total payable amount
+ * Computes subtotal, 18% GST, and total payable amount dynamically
+ * using the real-time live market exchange rate (never hardcoded)
  */
-export const calculatePricingWithGST = (plan = "monthly", currency = "USD", paymentMethod = "auto") => {
+export const calculatePricingWithGST = async (plan = "monthly", currency = "USD", paymentMethod = "auto") => {
   const planConfig = PLANS[plan] || PLANS.monthly;
   const isUpiOrInr = currency.toUpperCase() === "INR" || paymentMethod.toLowerCase() === "upi";
+  const liveRate = await getLiveUsdToInrRate();
 
   if (isUpiOrInr) {
-    const subtotalInr = Math.round(planConfig.baseAmountUsd * EXCHANGE_RATE); // ₹774 or ₹5,074
-    const gstInr = Math.round(subtotalInr * GST_RATE); // 18% GST: ₹139 or ₹913
-    const totalInr = subtotalInr + gstInr; // Total: ₹913 or ₹5,987
+    const subtotalInr = Math.round(planConfig.baseAmountUsd * liveRate); // e.g. $9 * 94.26
+    const gstInr = Math.round(subtotalInr * GST_RATE); // 18% GST
+    const totalInr = subtotalInr + gstInr;
 
     return {
       currency: "INR",
       baseAmountUsd: planConfig.baseAmountUsd,
-      exchangeRate: EXCHANGE_RATE,
+      exchangeRate: liveRate,
       subtotal: subtotalInr * 100, // in paise
       subtotalFormatted: `₹${subtotalInr.toLocaleString("en-IN")}`,
       taxRate: 18.0,
@@ -53,13 +53,13 @@ export const calculatePricingWithGST = (plan = "monthly", currency = "USD", paym
     };
   } else {
     const subtotalCents = planConfig.amountUsdCents; // 900 or 5900 cents ($9 or $59)
-    const gstCents = Math.round(subtotalCents * GST_RATE); // 18% GST: 162 or 1062 cents ($1.62 or $10.62)
+    const gstCents = Math.round(subtotalCents * GST_RATE); // 18% GST: 162 or 1062 cents
     const totalCents = subtotalCents + gstCents; // Total: 1062 or 6962 cents ($10.62 or $69.62)
 
     return {
       currency: "USD",
       baseAmountUsd: planConfig.baseAmountUsd,
-      exchangeRate: EXCHANGE_RATE,
+      exchangeRate: liveRate,
       subtotal: subtotalCents,
       subtotalFormatted: `$${(subtotalCents / 100).toFixed(2)}`,
       taxRate: 18.0,
@@ -75,17 +75,38 @@ export const calculatePricingWithGST = (plan = "monthly", currency = "USD", paym
 };
 
 /**
+ * GET /api/payment/exchange-rate
+ * Returns real-time market exchange rate and statutory GST info
+ */
+export const getExchangeRate = async (req, res) => {
+  try {
+    const rate = await getLiveUsdToInrRate();
+    return res.status(200).json({
+      success: true,
+      base: "USD",
+      target: "INR",
+      rate,
+      gstRate: 0.18,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to fetch live exchange rate" });
+  }
+};
+
+/**
  * POST /api/payment/create-order
- * 1. Computes base subtotal + 18% GST tax
- * 2. Creates Razorpay Order with total amount (Subtotal + 18% GST)
- * 3. Records new order in the `orders` database table with itemized GST breakdown
+ * 1. Dynamically checks live USD-to-INR market rate (no hardcoded rate)
+ * 2. Computes base subtotal + 18% GST tax
+ * 3. Creates Razorpay Order with total amount (Subtotal + 18% GST)
+ * 4. Records new order in the `orders` database table with real-time exchange rate
  */
 export const createOrder = async (req, res) => {
   try {
     const userId = req.user.id;
     const { plan = "monthly", currency = "USD", paymentMethod = "auto" } = req.body;
 
-    const pricing = calculatePricingWithGST(plan, currency, paymentMethod);
+    const pricing = await calculatePricingWithGST(plan, currency, paymentMethod);
 
     const orderOptions = {
       amount: pricing.totalAmount, // Charge amount includes 18% GST
@@ -108,7 +129,7 @@ export const createOrder = async (req, res) => {
 
     const order = await razorpayInstance.orders.create(orderOptions);
 
-    // 1. Insert order record into `orders` table with 18% GST columns
+    // 1. Insert order record into `orders` table with live exchange rate and 18% GST
     const orderRecordId = crypto.randomUUID();
     try {
       await pool.query(

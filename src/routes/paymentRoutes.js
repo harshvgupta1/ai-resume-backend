@@ -6,10 +6,14 @@ import {
   cancelSubscription,
   getUserOrders,
   getUserTransactions,
+  getExchangeRate,
 } from "../controllers/paymentController.js";
 import { authenticateToken } from "../middleware/authMiddleware.js";
 
 const router = Router();
+
+// GET /api/payment/exchange-rate - Real-time live market exchange rate USD -> INR
+router.get("/exchange-rate", getExchangeRate);
 
 // POST /api/payment/create-order - Initialize Razorpay Order (Authenticated)
 router.post("/create-order", authenticateToken, createOrder);
