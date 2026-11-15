@@ -5,83 +5,133 @@ import { pool } from "../config/db.js";
 // Standard exchange rate: 1 USD = 86.00 INR
 const EXCHANGE_RATE = 86.0;
 
-// Base Pricing Definition in USD & Converted INR
+// Standard Statutory Tax Rate for SaaS Services in India: 18% GST
+const GST_RATE = 0.18;
+
+// Base Pricing Definition in USD
 const PLANS = {
   monthly: {
     baseAmountUsd: 9.0, // $9.00 USD
     amountUsdCents: 900, // 900 cents
-    amountInrPaise: Math.round(9.0 * EXCHANGE_RATE * 100), // ₹774 (77400 paise)
     durationDays: 30,
     label: "ResumeAI Pro Monthly",
   },
   yearly: {
     baseAmountUsd: 59.0, // $59.00 USD
     amountUsdCents: 5900, // 5900 cents
-    amountInrPaise: Math.round(59.0 * EXCHANGE_RATE * 100), // ₹5,074 (507400 paise)
     durationDays: 365,
     label: "ResumeAI Pro Annual (Save ~45%)",
   },
 };
 
 /**
+ * Helper to compute subtotal, 18% GST, and total payable amount
+ */
+export const calculatePricingWithGST = (plan = "monthly", currency = "USD", paymentMethod = "auto") => {
+  const planConfig = PLANS[plan] || PLANS.monthly;
+  const isUpiOrInr = currency.toUpperCase() === "INR" || paymentMethod.toLowerCase() === "upi";
+
+  if (isUpiOrInr) {
+    const subtotalInr = Math.round(planConfig.baseAmountUsd * EXCHANGE_RATE); // ₹774 or ₹5,074
+    const gstInr = Math.round(subtotalInr * GST_RATE); // 18% GST: ₹139 or ₹913
+    const totalInr = subtotalInr + gstInr; // Total: ₹913 or ₹5,987
+
+    return {
+      currency: "INR",
+      baseAmountUsd: planConfig.baseAmountUsd,
+      exchangeRate: EXCHANGE_RATE,
+      subtotal: subtotalInr * 100, // in paise
+      subtotalFormatted: `₹${subtotalInr.toLocaleString("en-IN")}`,
+      taxRate: 18.0,
+      taxAmount: gstInr * 100, // in paise
+      taxAmountFormatted: `₹${gstInr.toLocaleString("en-IN")}`,
+      totalAmount: totalInr * 100, // in paise
+      totalAmountFormatted: `₹${totalInr.toLocaleString("en-IN")}`,
+      durationDays: planConfig.durationDays,
+      label: planConfig.label,
+      isUpiSupported: true,
+    };
+  } else {
+    const subtotalCents = planConfig.amountUsdCents; // 900 or 5900 cents ($9 or $59)
+    const gstCents = Math.round(subtotalCents * GST_RATE); // 18% GST: 162 or 1062 cents ($1.62 or $10.62)
+    const totalCents = subtotalCents + gstCents; // Total: 1062 or 6962 cents ($10.62 or $69.62)
+
+    return {
+      currency: "USD",
+      baseAmountUsd: planConfig.baseAmountUsd,
+      exchangeRate: EXCHANGE_RATE,
+      subtotal: subtotalCents,
+      subtotalFormatted: `$${(subtotalCents / 100).toFixed(2)}`,
+      taxRate: 18.0,
+      taxAmount: gstCents,
+      taxAmountFormatted: `$${(gstCents / 100).toFixed(2)}`,
+      totalAmount: totalCents,
+      totalAmountFormatted: `$${(totalCents / 100).toFixed(2)}`,
+      durationDays: planConfig.durationDays,
+      label: planConfig.label,
+      isUpiSupported: false,
+    };
+  }
+};
+
+/**
  * POST /api/payment/create-order
- * 1. Converts USD to INR for Indian users wishing to pay via UPI (or keeps USD for Card payments)
- * 2. Creates Razorpay Order
- * 3. Records new order in the `orders` database table
+ * 1. Computes base subtotal + 18% GST tax
+ * 2. Creates Razorpay Order with total amount (Subtotal + 18% GST)
+ * 3. Records new order in the `orders` database table with itemized GST breakdown
  */
 export const createOrder = async (req, res) => {
   try {
     const userId = req.user.id;
     const { plan = "monthly", currency = "USD", paymentMethod = "auto" } = req.body;
 
-    const planConfig = PLANS[plan] || PLANS.monthly;
-
-    // Determine target currency and amount:
-    // UPI requires INR. If paymentMethod is "upi" or currency is "INR", charge in INR.
-    const isUpiOrInr = currency.toUpperCase() === "INR" || paymentMethod.toLowerCase() === "upi";
-    const targetCurrency = isUpiOrInr ? "INR" : "USD";
-    const chargeAmount = isUpiOrInr ? planConfig.amountInrPaise : planConfig.amountUsdCents;
-    const amountFormatted = isUpiOrInr
-      ? `₹${(planConfig.amountInrPaise / 100).toLocaleString("en-IN")}`
-      : `$${planConfig.baseAmountUsd.toFixed(2)}`;
+    const pricing = calculatePricingWithGST(plan, currency, paymentMethod);
 
     const orderOptions = {
-      amount: chargeAmount,
-      currency: targetCurrency,
+      amount: pricing.totalAmount, // Charge amount includes 18% GST
+      currency: pricing.currency,
       receipt: `rcpt_${userId.slice(0, 8)}_${Date.now()}`,
       notes: {
         userId,
         plan,
-        baseAmountUsd: String(planConfig.baseAmountUsd),
-        exchangeRate: String(EXCHANGE_RATE),
-        targetCurrency,
+        baseAmountUsd: String(pricing.baseAmountUsd),
+        subtotal: pricing.subtotalFormatted,
+        gstRate: "18%",
+        gstAmount: pricing.taxAmountFormatted,
+        totalPayable: pricing.totalAmountFormatted,
+        exchangeRate: String(pricing.exchangeRate),
+        targetCurrency: pricing.currency,
         paymentMethodPreference: paymentMethod,
-        label: planConfig.label,
+        label: pricing.label,
       },
     };
 
     const order = await razorpayInstance.orders.create(orderOptions);
 
-    // 1. Insert order record into `orders` table
+    // 1. Insert order record into `orders` table with 18% GST columns
     const orderRecordId = crypto.randomUUID();
     try {
       await pool.query(
         `INSERT INTO orders (
            id, user_id, razorpay_order_id, plan, billing_cycle,
-           base_currency, base_amount, exchange_rate, currency, amount, amount_formatted,
+           base_currency, base_amount, exchange_rate, currency,
+           subtotal, tax_rate, tax_amount, amount, amount_formatted,
            payment_method_preference, status
-         ) VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, 'created')`,
+         ) VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'created')`,
         [
           orderRecordId,
           userId,
           order.id,
           `pro_${plan}`,
           plan,
-          planConfig.baseAmountUsd,
-          EXCHANGE_RATE,
-          targetCurrency,
-          chargeAmount,
-          amountFormatted,
+          pricing.baseAmountUsd,
+          pricing.exchangeRate,
+          pricing.currency,
+          pricing.subtotal,
+          pricing.taxRate,
+          pricing.taxAmount,
+          pricing.totalAmount,
+          pricing.totalAmountFormatted,
           paymentMethod,
         ]
       );
@@ -95,7 +145,7 @@ export const createOrder = async (req, res) => {
       await pool.query(
         `INSERT INTO payments (id, user_id, order_id, amount, currency, plan, status)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [paymentRecordId, userId, order.id, chargeAmount, targetCurrency, plan, "created"]
+        [paymentRecordId, userId, order.id, pricing.totalAmount, pricing.currency, plan, "created"]
       );
     } catch (dbErr) {
       console.warn("[MySQL] Legacy payment record insert warning:", dbErr.message);
@@ -107,13 +157,16 @@ export const createOrder = async (req, res) => {
       internalOrderId: orderRecordId,
       amount: order.amount,
       currency: order.currency,
-      amountFormatted,
-      baseAmountUsd: planConfig.baseAmountUsd,
-      exchangeRate: EXCHANGE_RATE,
+      subtotalFormatted: pricing.subtotalFormatted,
+      taxRate: "18% GST",
+      taxAmountFormatted: pricing.taxAmountFormatted,
+      amountFormatted: pricing.totalAmountFormatted,
+      baseAmountUsd: pricing.baseAmountUsd,
+      exchangeRate: pricing.exchangeRate,
       keyId: RAZORPAY_CONFIG.keyId,
       plan,
-      label: planConfig.label,
-      isUpiSupported: targetCurrency === "INR",
+      label: pricing.label,
+      isUpiSupported: pricing.isUpiSupported,
     });
   } catch (error) {
     console.error("Razorpay order creation error:", error);
@@ -128,7 +181,7 @@ export const createOrder = async (req, res) => {
  * POST /api/payment/verify
  * 1. Cryptographically verifies Razorpay HMAC signature
  * 2. Marks order as `paid` in `orders` table
- * 3. Records successful transaction in `transactions` table
+ * 3. Records successful transaction in `transactions` table with 18% GST breakdown
  * 4. Activates subscription in `subscriptions` table with exact expiration date
  * 5. Upgrades user plan to PRO in `users` table
  */
@@ -178,9 +231,12 @@ export const verifyPayment = async (req, res) => {
     const planKey = matchedOrder?.billing_cycle || plan;
     const planConfig = PLANS[planKey] || PLANS.monthly;
     const daysToAdd = planConfig.durationDays;
-    const chargedAmount = matchedOrder?.amount || (matchedOrder?.currency === "INR" ? planConfig.amountInrPaise : planConfig.amountUsdCents);
+    const chargedAmount = matchedOrder?.amount || (matchedOrder?.currency === "INR" ? 91300 : 1062);
     const chargedCurrency = matchedOrder?.currency || "USD";
-    const amountFormatted = matchedOrder?.amount_formatted || (chargedCurrency === "INR" ? `₹${(chargedAmount / 100).toLocaleString("en-IN")}` : `$${planConfig.baseAmountUsd.toFixed(2)}`);
+    const amountFormatted = matchedOrder?.amount_formatted || (chargedCurrency === "INR" ? `₹913` : `$10.62`);
+    const subtotal = matchedOrder?.subtotal || (chargedCurrency === "INR" ? 77400 : 900);
+    const taxAmount = matchedOrder?.tax_amount || (chargedCurrency === "INR" ? 13900 : 162);
+    const taxRate = matchedOrder?.tax_rate || 18.0;
 
     // 2. Mark order as PAID in `orders` table
     try {
@@ -194,14 +250,15 @@ export const verifyPayment = async (req, res) => {
       console.warn("[MySQL] Warning updating orders table status:", orderUpdateErr.message);
     }
 
-    // 3. Create successful payment transaction in `transactions` table
+    // 3. Create successful payment transaction in `transactions` table with GST tax breakdown
     const transactionId = crypto.randomUUID();
     try {
       await pool.query(
         `INSERT INTO transactions (
            id, order_id, user_id, razorpay_order_id, razorpay_payment_id,
-           razorpay_signature, amount, currency, amount_formatted, payment_method, status
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success')`,
+           razorpay_signature, currency, subtotal, tax_rate, tax_amount,
+           amount, amount_formatted, payment_method, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success')`,
         [
           transactionId,
           matchedOrder?.id || razorpay_order_id,
@@ -209,13 +266,16 @@ export const verifyPayment = async (req, res) => {
           razorpay_order_id,
           razorpay_payment_id,
           razorpay_signature,
-          chargedAmount,
           chargedCurrency,
+          subtotal,
+          taxRate,
+          taxAmount,
+          chargedAmount,
           amountFormatted,
           paymentMethod || matchedOrder?.payment_method_preference || "card",
         ]
       );
-      console.log(`[MySQL] Successfully logged transaction ${transactionId} for payment ${razorpay_payment_id}`);
+      console.log(`[MySQL] Logged transaction ${transactionId} (including 18% GST) for payment ${razorpay_payment_id}`);
     } catch (txErr) {
       console.warn("[MySQL] Transactions table insert warning:", txErr.message);
     }
@@ -293,8 +353,6 @@ export const verifyPayment = async (req, res) => {
       ? Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
       : daysToAdd;
 
-    console.log(`[Razorpay] Upgraded user ${userId} to PRO via transaction ${transactionId}. Expires: ${expiresAt}`);
-
     return res.status(200).json({
       success: true,
       message: `🎉 Payment verified! You are now upgraded to ResumeAI PRO.`,
@@ -303,6 +361,12 @@ export const verifyPayment = async (req, res) => {
       paymentId: razorpay_payment_id,
       amountFormatted,
       currency: chargedCurrency,
+      taxBreakdown: {
+        subtotal: chargedCurrency === "INR" ? `₹${(subtotal / 100).toLocaleString("en-IN")}` : `$${(subtotal / 100).toFixed(2)}`,
+        gstRate: "18%",
+        gstAmount: chargedCurrency === "INR" ? `₹${(taxAmount / 100).toLocaleString("en-IN")}` : `$${(taxAmount / 100).toFixed(2)}`,
+        total: amountFormatted,
+      },
       user: {
         id: updatedUser.id,
         email: updatedUser.email,

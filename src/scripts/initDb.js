@@ -101,7 +101,7 @@ async function initDatabase() {
     `);
     console.log("✅ Table `job_applications` created or verified.");
 
-    // 5. Orders table (tracks checkout orders and currency conversion from USD to INR)
+    // 5. Orders table (tracks checkout orders, 18% GST and currency conversion from USD to INR)
     await dbConn.query(`
       CREATE TABLE IF NOT EXISTS orders (
         id VARCHAR(36) PRIMARY KEY,
@@ -113,6 +113,9 @@ async function initDatabase() {
         base_amount DECIMAL(10, 2) NOT NULL DEFAULT 9.00,
         exchange_rate DECIMAL(10, 4) NOT NULL DEFAULT 86.00,
         currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+        subtotal INT NOT NULL DEFAULT 0,
+        tax_rate DECIMAL(5, 2) NOT NULL DEFAULT 18.00,
+        tax_amount INT NOT NULL DEFAULT 0,
         amount INT NOT NULL,
         amount_formatted VARCHAR(50) NOT NULL,
         payment_method_preference VARCHAR(50) DEFAULT 'auto',
@@ -126,7 +129,7 @@ async function initDatabase() {
     `);
     console.log("✅ Table `orders` created or verified.");
 
-    // 6. Transactions table (records verified successful payments)
+    // 6. Transactions table (records verified successful payments with GST tax breakdown)
     await dbConn.query(`
       CREATE TABLE IF NOT EXISTS transactions (
         id VARCHAR(36) PRIMARY KEY,
@@ -135,8 +138,11 @@ async function initDatabase() {
         razorpay_order_id VARCHAR(255) NOT NULL,
         razorpay_payment_id VARCHAR(255) UNIQUE NOT NULL,
         razorpay_signature VARCHAR(255) NOT NULL,
-        amount INT NOT NULL,
         currency VARCHAR(10) NOT NULL,
+        subtotal INT NOT NULL DEFAULT 0,
+        tax_rate DECIMAL(5, 2) NOT NULL DEFAULT 18.00,
+        tax_amount INT NOT NULL DEFAULT 0,
+        amount INT NOT NULL,
         amount_formatted VARCHAR(50) NOT NULL,
         payment_method VARCHAR(50) DEFAULT 'card',
         status ENUM('success', 'failed', 'refunded') DEFAULT 'success',
