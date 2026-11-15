@@ -101,7 +101,54 @@ async function initDatabase() {
     `);
     console.log("✅ Table `job_applications` created or verified.");
 
-    // 5. Payments table
+    // 5. Orders table (tracks checkout orders and currency conversion from USD to INR)
+    await dbConn.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id VARCHAR(36) PRIMARY KEY,
+        user_id VARCHAR(36) NOT NULL,
+        razorpay_order_id VARCHAR(255) UNIQUE NOT NULL,
+        plan VARCHAR(50) NOT NULL,
+        billing_cycle ENUM('monthly', 'yearly') NOT NULL DEFAULT 'monthly',
+        base_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+        base_amount DECIMAL(10, 2) NOT NULL DEFAULT 9.00,
+        exchange_rate DECIMAL(10, 4) NOT NULL DEFAULT 86.00,
+        currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+        amount INT NOT NULL,
+        amount_formatted VARCHAR(50) NOT NULL,
+        payment_method_preference VARCHAR(50) DEFAULT 'auto',
+        status ENUM('created', 'paid', 'failed', 'cancelled') DEFAULT 'created',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_user_id (user_id),
+        INDEX idx_razorpay_order (razorpay_order_id),
+        INDEX idx_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    console.log("✅ Table `orders` created or verified.");
+
+    // 6. Transactions table (records verified successful payments)
+    await dbConn.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id VARCHAR(36) PRIMARY KEY,
+        order_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        razorpay_order_id VARCHAR(255) NOT NULL,
+        razorpay_payment_id VARCHAR(255) UNIQUE NOT NULL,
+        razorpay_signature VARCHAR(255) NOT NULL,
+        amount INT NOT NULL,
+        currency VARCHAR(10) NOT NULL,
+        amount_formatted VARCHAR(50) NOT NULL,
+        payment_method VARCHAR(50) DEFAULT 'card',
+        status ENUM('success', 'failed', 'refunded') DEFAULT 'success',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user_id (user_id),
+        INDEX idx_order_id (order_id),
+        INDEX idx_razorpay_payment (razorpay_payment_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+    console.log("✅ Table `transactions` created or verified.");
+
+    // 7. Payments table (legacy log)
     await dbConn.query(`
       CREATE TABLE IF NOT EXISTS payments (
         id VARCHAR(36) PRIMARY KEY,
@@ -120,11 +167,13 @@ async function initDatabase() {
     `);
     console.log("✅ Table `payments` created or verified.");
 
-    // 6. Subscriptions table (track recurring Pro plans and expiration dates)
+    // 8. Subscriptions table (track recurring Pro plans and expiration dates)
     await dbConn.query(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id VARCHAR(36) PRIMARY KEY,
         user_id VARCHAR(36) NOT NULL,
+        order_id VARCHAR(36) NULL,
+        transaction_id VARCHAR(36) NULL,
         plan VARCHAR(50) NOT NULL DEFAULT 'pro_monthly',
         billing_cycle ENUM('monthly', 'yearly') NOT NULL DEFAULT 'monthly',
         status ENUM('active', 'expired', 'cancelled', 'past_due') NOT NULL DEFAULT 'active',

@@ -2,63 +2,118 @@ import crypto from "crypto";
 import { razorpayInstance, RAZORPAY_CONFIG } from "../config/razorpay.js";
 import { pool } from "../config/db.js";
 
-// Plans definition in INR (paise: 1 INR = 100 paise)
+// Standard exchange rate: 1 USD = 86.00 INR
+const EXCHANGE_RATE = 86.0;
+
+// Base Pricing Definition in USD & Converted INR
 const PLANS = {
   monthly: {
-    amount: 49900, // ₹499
+    baseAmountUsd: 9.0, // $9.00 USD
+    amountUsdCents: 900, // 900 cents
+    amountInrPaise: Math.round(9.0 * EXCHANGE_RATE * 100), // ₹774 (77400 paise)
     durationDays: 30,
     label: "ResumeAI Pro Monthly",
   },
   yearly: {
-    amount: 299900, // ₹2,999 (~₹250/mo)
+    baseAmountUsd: 59.0, // $59.00 USD
+    amountUsdCents: 5900, // 5900 cents
+    amountInrPaise: Math.round(59.0 * EXCHANGE_RATE * 100), // ₹5,074 (507400 paise)
     durationDays: 365,
-    label: "ResumeAI Pro Annual (50% Off)",
+    label: "ResumeAI Pro Annual (Save ~45%)",
   },
 };
 
 /**
  * POST /api/payment/create-order
- * Creates a Razorpay Order and logs it in the payments table
+ * 1. Converts USD to INR for Indian users wishing to pay via UPI (or keeps USD for Card payments)
+ * 2. Creates Razorpay Order
+ * 3. Records new order in the `orders` database table
  */
 export const createOrder = async (req, res) => {
   try {
     const userId = req.user.id;
-    const { plan = "monthly" } = req.body;
+    const { plan = "monthly", currency = "USD", paymentMethod = "auto" } = req.body;
 
     const planConfig = PLANS[plan] || PLANS.monthly;
+
+    // Determine target currency and amount:
+    // UPI requires INR. If paymentMethod is "upi" or currency is "INR", charge in INR.
+    const isUpiOrInr = currency.toUpperCase() === "INR" || paymentMethod.toLowerCase() === "upi";
+    const targetCurrency = isUpiOrInr ? "INR" : "USD";
+    const chargeAmount = isUpiOrInr ? planConfig.amountInrPaise : planConfig.amountUsdCents;
+    const amountFormatted = isUpiOrInr
+      ? `₹${(planConfig.amountInrPaise / 100).toLocaleString("en-IN")}`
+      : `$${planConfig.baseAmountUsd.toFixed(2)}`;
+
     const orderOptions = {
-      amount: planConfig.amount,
-      currency: "INR",
+      amount: chargeAmount,
+      currency: targetCurrency,
       receipt: `rcpt_${userId.slice(0, 8)}_${Date.now()}`,
       notes: {
         userId,
         plan,
+        baseAmountUsd: String(planConfig.baseAmountUsd),
+        exchangeRate: String(EXCHANGE_RATE),
+        targetCurrency,
+        paymentMethodPreference: paymentMethod,
         label: planConfig.label,
       },
     };
 
     const order = await razorpayInstance.orders.create(orderOptions);
 
-    // Save initial payment record in MySQL
-    const paymentRecordId = crypto.randomUUID();
+    // 1. Insert order record into `orders` table
+    const orderRecordId = crypto.randomUUID();
     try {
+      await pool.query(
+        `INSERT INTO orders (
+           id, user_id, razorpay_order_id, plan, billing_cycle,
+           base_currency, base_amount, exchange_rate, currency, amount, amount_formatted,
+           payment_method_preference, status
+         ) VALUES (?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, 'created')`,
+        [
+          orderRecordId,
+          userId,
+          order.id,
+          `pro_${plan}`,
+          plan,
+          planConfig.baseAmountUsd,
+          EXCHANGE_RATE,
+          targetCurrency,
+          chargeAmount,
+          amountFormatted,
+          paymentMethod,
+        ]
+      );
+    } catch (orderDbErr) {
+      console.warn("[MySQL] Orders table insert warning:", orderDbErr.message);
+    }
+
+    // 2. Also keep legacy payments table in sync
+    try {
+      const paymentRecordId = crypto.randomUUID();
       await pool.query(
         `INSERT INTO payments (id, user_id, order_id, amount, currency, plan, status)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [paymentRecordId, userId, order.id, planConfig.amount, "INR", plan, "created"]
+        [paymentRecordId, userId, order.id, chargeAmount, targetCurrency, plan, "created"]
       );
     } catch (dbErr) {
-      console.warn("[MySQL] Payment order record insert warning:", dbErr.message);
+      console.warn("[MySQL] Legacy payment record insert warning:", dbErr.message);
     }
 
     return res.status(200).json({
       success: true,
       orderId: order.id,
+      internalOrderId: orderRecordId,
       amount: order.amount,
       currency: order.currency,
+      amountFormatted,
+      baseAmountUsd: planConfig.baseAmountUsd,
+      exchangeRate: EXCHANGE_RATE,
       keyId: RAZORPAY_CONFIG.keyId,
       plan,
       label: planConfig.label,
+      isUpiSupported: targetCurrency === "INR",
     });
   } catch (error) {
     console.error("Razorpay order creation error:", error);
@@ -71,7 +126,11 @@ export const createOrder = async (req, res) => {
 
 /**
  * POST /api/payment/verify
- * Cryptographically verifies Razorpay HMAC signature, creates/updates subscription & upgrades user plan
+ * 1. Cryptographically verifies Razorpay HMAC signature
+ * 2. Marks order as `paid` in `orders` table
+ * 3. Records successful transaction in `transactions` table
+ * 4. Activates subscription in `subscriptions` table with exact expiration date
+ * 5. Upgrades user plan to PRO in `users` table
  */
 export const verifyPayment = async (req, res) => {
   try {
@@ -81,6 +140,7 @@ export const verifyPayment = async (req, res) => {
       razorpay_payment_id,
       razorpay_signature,
       plan = "monthly",
+      paymentMethod = "card",
     } = req.body;
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -101,10 +161,66 @@ export const verifyPayment = async (req, res) => {
       return res.status(400).json({ error: "Payment signature verification failed." });
     }
 
-    const planConfig = PLANS[plan] || PLANS.monthly;
-    const daysToAdd = planConfig.durationDays;
+    // 1. Retrieve the matching order from `orders` table
+    let matchedOrder = null;
+    try {
+      const [orderRows] = await pool.query(
+        `SELECT * FROM orders WHERE razorpay_order_id = ? LIMIT 1`,
+        [razorpay_order_id]
+      );
+      if (orderRows.length > 0) {
+        matchedOrder = orderRows[0];
+      }
+    } catch (orderFetchErr) {
+      console.warn("Could not fetch matched order from DB:", orderFetchErr.message);
+    }
 
-    // 1. Update payment record to paid in MySQL
+    const planKey = matchedOrder?.billing_cycle || plan;
+    const planConfig = PLANS[planKey] || PLANS.monthly;
+    const daysToAdd = planConfig.durationDays;
+    const chargedAmount = matchedOrder?.amount || (matchedOrder?.currency === "INR" ? planConfig.amountInrPaise : planConfig.amountUsdCents);
+    const chargedCurrency = matchedOrder?.currency || "USD";
+    const amountFormatted = matchedOrder?.amount_formatted || (chargedCurrency === "INR" ? `₹${(chargedAmount / 100).toLocaleString("en-IN")}` : `$${planConfig.baseAmountUsd.toFixed(2)}`);
+
+    // 2. Mark order as PAID in `orders` table
+    try {
+      await pool.query(
+        `UPDATE orders 
+         SET status = 'paid', updated_at = NOW() 
+         WHERE razorpay_order_id = ?`,
+        [razorpay_order_id]
+      );
+    } catch (orderUpdateErr) {
+      console.warn("[MySQL] Warning updating orders table status:", orderUpdateErr.message);
+    }
+
+    // 3. Create successful payment transaction in `transactions` table
+    const transactionId = crypto.randomUUID();
+    try {
+      await pool.query(
+        `INSERT INTO transactions (
+           id, order_id, user_id, razorpay_order_id, razorpay_payment_id,
+           razorpay_signature, amount, currency, amount_formatted, payment_method, status
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'success')`,
+        [
+          transactionId,
+          matchedOrder?.id || razorpay_order_id,
+          userId,
+          razorpay_order_id,
+          razorpay_payment_id,
+          razorpay_signature,
+          chargedAmount,
+          chargedCurrency,
+          amountFormatted,
+          paymentMethod || matchedOrder?.payment_method_preference || "card",
+        ]
+      );
+      console.log(`[MySQL] Successfully logged transaction ${transactionId} for payment ${razorpay_payment_id}`);
+    } catch (txErr) {
+      console.warn("[MySQL] Transactions table insert warning:", txErr.message);
+    }
+
+    // 4. Update legacy payments table
     try {
       await pool.query(
         `UPDATE payments 
@@ -116,7 +232,7 @@ export const verifyPayment = async (req, res) => {
       console.warn("[MySQL] Warning updating payment record status:", dbErr.message);
     }
 
-    // 2. Mark any older active subscriptions for this user as superseded
+    // 5. Cancel any prior active subscriptions for this user
     try {
       await pool.query(
         `UPDATE subscriptions 
@@ -128,26 +244,30 @@ export const verifyPayment = async (req, res) => {
       console.warn("[MySQL] Subscriptions status update warning:", subErr.message);
     }
 
-    // 3. Insert new active subscription record into MySQL `subscriptions` table
+    // 6. Insert new active subscription into `subscriptions` table
     const subscriptionId = crypto.randomUUID();
     await pool.query(
       `INSERT INTO subscriptions (
-         id, user_id, plan, billing_cycle, status, amount, currency,
-         razorpay_order_id, razorpay_payment_id, current_period_start, current_period_end
-       ) VALUES (?, ?, ?, ?, 'active', ?, 'INR', ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))`,
+         id, user_id, order_id, transaction_id, plan, billing_cycle,
+         status, amount, currency, razorpay_order_id, razorpay_payment_id,
+         current_period_start, current_period_end
+       ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY))`,
       [
         subscriptionId,
         userId,
-        `pro_${plan}`,
-        plan === "yearly" ? "yearly" : "monthly",
-        planConfig.amount,
+        matchedOrder?.id || null,
+        transactionId,
+        `pro_${planKey}`,
+        planKey,
+        chargedAmount,
+        chargedCurrency,
         razorpay_order_id,
         razorpay_payment_id,
         daysToAdd,
       ]
     );
 
-    // 4. Upgrade user account to PRO with expiry in MySQL `users` table
+    // 7. Upgrade user account to PRO in MySQL `users` table
     await pool.query(
       `UPDATE users 
        SET plan = 'pro', pro_expires_at = DATE_ADD(NOW(), INTERVAL ? DAY)
@@ -155,7 +275,7 @@ export const verifyPayment = async (req, res) => {
       [daysToAdd, userId]
     );
 
-    // 5. Fetch fresh user profile & newly created subscription
+    // 8. Fetch fresh user profile & newly created subscription
     const [userRows] = await pool.query(
       `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
       [userId]
@@ -173,12 +293,16 @@ export const verifyPayment = async (req, res) => {
       ? Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))
       : daysToAdd;
 
-    console.log(`[Razorpay] Upgraded user ${userId} to PRO. Subscription: ${subscriptionId}, Expires: ${expiresAt}`);
+    console.log(`[Razorpay] Upgraded user ${userId} to PRO via transaction ${transactionId}. Expires: ${expiresAt}`);
 
     return res.status(200).json({
       success: true,
       message: `🎉 Payment verified! You are now upgraded to ResumeAI PRO.`,
+      transactionId,
+      orderId: razorpay_order_id,
       paymentId: razorpay_payment_id,
+      amountFormatted,
+      currency: chargedCurrency,
       user: {
         id: updatedUser.id,
         email: updatedUser.email,
@@ -197,6 +321,7 @@ export const verifyPayment = async (req, res) => {
             status: activeSub.status,
             amount: activeSub.amount,
             currency: activeSub.currency,
+            amountFormatted,
             currentPeriodStart: activeSub.current_period_start,
             currentPeriodEnd: activeSub.current_period_end,
             daysRemaining,
@@ -253,6 +378,10 @@ export const getSubscription = async (req, res) => {
       }
     }
 
+    const amountFormatted = sub.currency === "INR"
+      ? `₹${(sub.amount / 100).toLocaleString("en-IN")}`
+      : `$${(sub.amount / 100).toFixed(2)}`;
+
     return res.status(200).json({
       success: true,
       hasActiveSubscription: !isExpired && sub.status === "active",
@@ -263,7 +392,7 @@ export const getSubscription = async (req, res) => {
         billingCycle: sub.billing_cycle,
         status: sub.status,
         amount: sub.amount,
-        amountFormatted: `₹${(sub.amount / 100).toLocaleString("en-IN")}`,
+        amountFormatted,
         currency: sub.currency,
         razorpayPaymentId: sub.razorpay_payment_id,
         razorpayOrderId: sub.razorpay_order_id,
@@ -285,6 +414,40 @@ export const getSubscription = async (req, res) => {
       error: "Failed to retrieve subscription status.",
       details: error.message,
     });
+  }
+};
+
+/**
+ * GET /api/payment/orders
+ * Returns order history for current authenticated user
+ */
+export const getUserOrders = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [rows] = await pool.query(
+      `SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC`,
+      [userId]
+    );
+    return res.status(200).json({ success: true, orders: rows });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to fetch orders", details: error.message });
+  }
+};
+
+/**
+ * GET /api/payment/transactions
+ * Returns transaction records for current authenticated user
+ */
+export const getUserTransactions = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [rows] = await pool.query(
+      `SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC`,
+      [userId]
+    );
+    return res.status(200).json({ success: true, transactions: rows });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to fetch transactions", details: error.message });
   }
 };
 
