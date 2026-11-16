@@ -358,7 +358,7 @@ export const verifyPayment = async (req, res) => {
 
     // 8. Fetch fresh user profile & newly created subscription
     const [userRows] = await pool.query(
-      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
+      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date FROM users WHERE id = ?`,
       [userId]
     );
     const updatedUser = userRows[0] || {};
@@ -393,9 +393,13 @@ export const verifyPayment = async (req, res) => {
         email: updatedUser.email,
         name: updatedUser.name,
         avatarUrl: updatedUser.avatar_url,
-        plan: updatedUser.plan,
-        scansUsed: updatedUser.scans_used ?? 0,
-        scansLimit: 3,
+        plan: "pro",
+        isPro: true,
+        scansUsed: 0,
+        scansLimit: 24,
+        scansRemaining: 24,
+        dailyScansUsed: 0,
+        dailyScansLimit: 24,
         proExpiresAt: updatedUser.pro_expires_at,
       },
       subscription: activeSub

@@ -6,6 +6,38 @@ import { pool } from "../config/db.js";
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const JWT_SECRET = process.env.JWT_SECRET || "ai_resume_super_secret_jwt_key_2026";
 
+/**
+ * Formats user object with daily scan quota for subscription users (24 daily)
+ * and lifetime quota for free tier users (3 lifetime)
+ */
+export const formatUserWithQuota = (u, activeSubscription = null) => {
+  const now = new Date();
+  const isPro = u.plan === "pro" && (!u.pro_expires_at || new Date(u.pro_expires_at) > now);
+  const todayStr = now.toISOString().slice(0, 10);
+  const dailyScansUsed = isPro && u.daily_scans_date === todayStr ? (u.daily_scans_used || 0) : 0;
+  const scansLimit = isPro ? 24 : 3;
+  const scansUsed = isPro ? dailyScansUsed : (u.scans_used ?? 0);
+  const scansRemaining = Math.max(0, scansLimit - scansUsed);
+
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    avatarUrl: u.avatarUrl || u.avatar_url,
+    plan: isPro ? "pro" : (u.plan || "free"),
+    isPro,
+    scansUsed,
+    scansLimit,
+    scansRemaining,
+    dailyScansUsed,
+    dailyScansLimit: 24,
+    dailyScansRemaining: Math.max(0, 24 - dailyScansUsed),
+    proExpiresAt: u.pro_expires_at || (activeSubscription ? activeSubscription.currentPeriodEnd : null),
+    createdAt: u.created_at,
+    subscription: activeSubscription,
+  };
+};
+
 export const googleLogin = async (req, res) => {
   try {
     const { credential, userInfo } = req.body;
@@ -80,7 +112,7 @@ export const googleLogin = async (req, res) => {
 
     try {
       const [rows] = await pool.query(
-        `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE email = ?`,
+        `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date FROM users WHERE email = ?`,
         [googleUser.email]
       );
       if (rows.length > 0) {
@@ -105,16 +137,7 @@ export const googleLogin = async (req, res) => {
       success: true,
       message: "Successfully authenticated with Google SSO",
       token,
-      user: {
-        id: activeUser.id,
-        email: activeUser.email,
-        name: activeUser.name,
-        avatarUrl: activeUser.avatarUrl || activeUser.avatar_url,
-        plan: activeUser.plan || "free",
-        scansUsed: activeUser.scans_used ?? 0,
-        scansLimit: 3,
-        proExpiresAt: activeUser.pro_expires_at || null,
-      },
+      user: formatUserWithQuota(activeUser),
     });
   } catch (error) {
     console.error("Google Auth Error:", error);
@@ -129,7 +152,7 @@ export const getMe = async (req, res) => {
   try {
     const userId = req.user.id;
     const [rows] = await pool.query(
-      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, created_at, last_login_at FROM users WHERE id = ?`,
+      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date, created_at, last_login_at FROM users WHERE id = ?`,
       [userId]
     );
 
@@ -180,18 +203,7 @@ export const getMe = async (req, res) => {
     }
 
     return res.status(200).json({
-      user: {
-        id: u.id,
-        email: u.email,
-        name: u.name,
-        avatarUrl: u.avatar_url,
-        plan: u.plan || "free",
-        scansUsed: u.scans_used ?? 0,
-        scansLimit: 3,
-        proExpiresAt: u.pro_expires_at || (activeSubscription ? activeSubscription.currentPeriodEnd : null),
-        createdAt: u.created_at,
-        subscription: activeSubscription,
-      },
+      user: formatUserWithQuota(u, activeSubscription),
     });
   } catch (error) {
     return res.status(500).json({ error: "Failed to fetch user profile", details: error.message });
@@ -225,7 +237,7 @@ export const upgradePlan = async (req, res) => {
     }
 
     const [rows] = await pool.query(
-      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
+      `SELECT id, email, name, avatar_url, plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date, created_at FROM users WHERE id = ?`,
       [userId]
     );
 
@@ -233,16 +245,7 @@ export const upgradePlan = async (req, res) => {
     return res.status(200).json({
       success: true,
       message: `Successfully upgraded to ${plan.toUpperCase()}!`,
-      user: {
-        id: u.id,
-        email: u.email,
-        name: u.name,
-        avatarUrl: u.avatar_url,
-        plan: u.plan,
-        scansUsed: u.scans_used ?? 0,
-        scansLimit: 3,
-        proExpiresAt: u.pro_expires_at,
-      },
+      user: formatUserWithQuota(u),
     });
   } catch (error) {
     console.error("Error upgrading plan:", error);

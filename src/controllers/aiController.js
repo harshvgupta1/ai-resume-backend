@@ -37,7 +37,7 @@ export const matchResume = async (req, res) => {
 
     // Verify quota & plan
     const [userRows] = await pool.query(
-      `SELECT plan, scans_used, pro_expires_at FROM users WHERE id = ?`,
+      `SELECT plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date FROM users WHERE id = ?`,
       [userId]
     );
 
@@ -46,16 +46,33 @@ export const matchResume = async (req, res) => {
     }
 
     const userProfile = userRows[0];
-    const isPro = userProfile.plan === "pro";
-    const scansUsed = userProfile.scans_used || 0;
-    const FREE_LIMIT = 3;
+    const now = new Date();
+    const isPro = userProfile.plan === "pro" && (!userProfile.pro_expires_at || new Date(userProfile.pro_expires_at) > now);
+    const todayStr = now.toISOString().slice(0, 10);
 
-    if (!isPro && scansUsed >= FREE_LIMIT) {
+    const FREE_LIMIT = 3;
+    const PRO_DAILY_LIMIT = 24;
+
+    const freeScansUsed = userProfile.scans_used || 0;
+    const dailyScansUsed = isPro && userProfile.daily_scans_date === todayStr ? (userProfile.daily_scans_used || 0) : 0;
+
+    if (!isPro && freeScansUsed >= FREE_LIMIT) {
       return res.status(403).json({
-        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for unlimited AI scans!`,
+        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for 24 AI scans daily!`,
         upgradeRequired: true,
-        scansUsed,
+        scansUsed: freeScansUsed,
         scansLimit: FREE_LIMIT,
+        scansRemaining: 0,
+      });
+    }
+
+    if (isPro && dailyScansUsed >= PRO_DAILY_LIMIT) {
+      return res.status(403).json({
+        error: `You have reached your daily limit of ${PRO_DAILY_LIMIT} scans. Your daily quota resets tomorrow!`,
+        dailyLimitReached: true,
+        scansUsed: dailyScansUsed,
+        scansLimit: PRO_DAILY_LIMIT,
+        scansRemaining: 0,
       });
     }
 
@@ -147,7 +164,7 @@ Respond with STRICT JSON adhering to this exact schema:
     analysisResult.createdAt = "Just now";
 
     // Persist to MySQL only if the user is authenticated
-    let newScansUsed = scansUsed;
+    let newScansUsed = isPro ? dailyScansUsed : freeScansUsed;
     if (userId) {
       try {
         await pool.query(
@@ -170,20 +187,28 @@ Respond with STRICT JSON adhering to this exact schema:
           ]
         );
 
-        // Increment scan count for free users
-        if (!isPro) {
+        if (isPro) {
+          if (userProfile.daily_scans_date === todayStr) {
+            await pool.query(`UPDATE users SET daily_scans_used = daily_scans_used + 1 WHERE id = ?`, [userId]);
+          } else {
+            await pool.query(`UPDATE users SET daily_scans_used = 1, daily_scans_date = ? WHERE id = ?`, [todayStr, userId]);
+          }
+          newScansUsed = dailyScansUsed + 1;
+        } else {
           await pool.query(`UPDATE users SET scans_used = scans_used + 1 WHERE id = ?`, [userId]);
-          newScansUsed += 1;
+          newScansUsed = freeScansUsed + 1;
         }
-        console.log(`[DB] Analysis saved for user ${userId} (scans_used: ${newScansUsed})`);
+        console.log(`[DB] Analysis saved for user ${userId} (${isPro ? "daily_scans" : "scans_used"}: ${newScansUsed})`);
       } catch (dbErr) {
         console.warn("[MySQL] Could not save analysis to DB (continuing without persist):", dbErr.message);
       }
     }
 
+    const activeLimit = isPro ? PRO_DAILY_LIMIT : FREE_LIMIT;
     analysisResult.userPlan = isPro ? "pro" : "free";
     analysisResult.scansUsed = newScansUsed;
-    analysisResult.scansLimit = FREE_LIMIT;
+    analysisResult.scansLimit = activeLimit;
+    analysisResult.scansRemaining = Math.max(0, activeLimit - newScansUsed);
 
     return res.status(200).json(analysisResult);
   } catch (error) {

@@ -50,7 +50,7 @@ export const uploadAndParseResume = async (req, res) => {
 
     // Check user plan and quota
     const [userRows] = await pool.query(
-      "SELECT plan, scans_used, pro_expires_at FROM users WHERE id = ?",
+      "SELECT plan, scans_used, pro_expires_at, daily_scans_used, daily_scans_date FROM users WHERE id = ?",
       [userId]
     );
 
@@ -59,16 +59,33 @@ export const uploadAndParseResume = async (req, res) => {
     }
 
     const userRecord = userRows[0];
-    const isPro = userRecord.plan === "pro";
-    const scansUsed = userRecord.scans_used || 0;
-    const FREE_LIMIT = 3;
+    const now = new Date();
+    const isPro = userRecord.plan === "pro" && (!userRecord.pro_expires_at || new Date(userRecord.pro_expires_at) > now);
+    const todayStr = now.toISOString().slice(0, 10);
 
-    if (!isPro && scansUsed >= FREE_LIMIT) {
+    const FREE_LIMIT = 3;
+    const PRO_DAILY_LIMIT = 24;
+
+    const freeScansUsed = userRecord.scans_used || 0;
+    const dailyScansUsed = isPro && userRecord.daily_scans_date === todayStr ? (userRecord.daily_scans_used || 0) : 0;
+
+    if (!isPro && freeScansUsed >= FREE_LIMIT) {
       return res.status(403).json({
-        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for unlimited AI scans!`,
+        error: `You have reached your limit of ${FREE_LIMIT} free scans. Upgrade to Pro for 24 AI scans daily!`,
         upgradeRequired: true,
-        scansUsed,
+        scansUsed: freeScansUsed,
         scansLimit: FREE_LIMIT,
+        scansRemaining: 0,
+      });
+    }
+
+    if (isPro && dailyScansUsed >= PRO_DAILY_LIMIT) {
+      return res.status(403).json({
+        error: `You have reached your daily limit of ${PRO_DAILY_LIMIT} scans. Your daily quota resets tomorrow!`,
+        dailyLimitReached: true,
+        scansUsed: dailyScansUsed,
+        scansLimit: PRO_DAILY_LIMIT,
+        scansRemaining: 0,
       });
     }
 
