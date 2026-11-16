@@ -122,7 +122,7 @@ export const googleLogin = async (req, res) => {
       // Fallback to activeUser
     }
 
-    // Sign Application JWT session token (valid for 7 days)
+    // Sign Application JWT session token (valid strictly for 24 hours - MongoDB-style session security policy)
     const token = jwt.sign(
       {
         id: activeUser.id,
@@ -130,7 +130,7 @@ export const googleLogin = async (req, res) => {
         name: activeUser.name,
       },
       JWT_SECRET,
-      { expiresIn: "7d" }
+      { expiresIn: "24h" }
     );
 
     return res.status(200).json({

@@ -24,7 +24,14 @@ export const matchResume = async (req, res) => {
           const token = authHeader.split(" ")[1];
           const decoded = jwt.verify(token, JWT_SECRET);
           userId = decoded.id;
-        } catch (e) {}
+        } catch (e) {
+          if (e.name === "TokenExpiredError") {
+            return res.status(401).json({
+              error: "Your 24-hour session has expired. Please sign in again.",
+              sessionExpired: true,
+            });
+          }
+        }
       }
     }
 
@@ -229,7 +236,14 @@ export const getAnalysisHistory = async (req, res) => {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
-      } catch (e) {}
+      } catch (e) {
+        if (e.name === "TokenExpiredError") {
+          return res.status(401).json({
+            error: "Your 24-hour session has expired. Please sign in again.",
+            sessionExpired: true,
+          });
+        }
+      }
     }
 
     // If user is not logged in, return empty — frontend uses localStorage
@@ -308,7 +322,14 @@ export const deleteAnalysis = async (req, res) => {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
-      } catch (e) {}
+      } catch (e) {
+        if (e.name === "TokenExpiredError") {
+          return res.status(401).json({
+            error: "Your 24-hour session has expired. Please sign in again.",
+            sessionExpired: true,
+          });
+        }
+      }
     }
 
     if (!userId) {
@@ -332,7 +353,14 @@ export const generateCoverLetter = async (req, res) => {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
-      } catch (e) {}
+      } catch (e) {
+        if (e.name === "TokenExpiredError") {
+          return res.status(401).json({
+            error: "Your 24-hour session has expired. Please sign in again.",
+            sessionExpired: true,
+          });
+        }
+      }
     }
 
     if (!userId) {

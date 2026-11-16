@@ -15,6 +15,15 @@ export const authenticateToken = (req, res, next) => {
     req.user = decoded; // { id, email, name }
     next();
   } catch (err) {
-    return res.status(403).json({ error: "Invalid or expired session token." });
+    if (err.name === "TokenExpiredError") {
+      return res.status(401).json({
+        error: "Your 24-hour session has expired. Please sign in again.",
+        sessionExpired: true,
+      });
+    }
+    return res.status(401).json({
+      error: "Invalid or expired session token. Please sign in again.",
+      sessionExpired: true,
+    });
   }
 };

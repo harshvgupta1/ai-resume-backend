@@ -37,7 +37,14 @@ export const uploadAndParseResume = async (req, res) => {
         const token = authHeader.split(" ")[1];
         const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.id;
-      } catch (e) {}
+      } catch (e) {
+        if (e.name === "TokenExpiredError") {
+          return res.status(401).json({
+            error: "Your 24-hour session has expired. Please sign in again.",
+            sessionExpired: true,
+          });
+        }
+      }
     }
 
     // Require sign in so we can accurately track the 3 free scans
